@@ -12,6 +12,7 @@ register 必须传 --workspace；其他命令从 config.json 读取。
 from __future__ import annotations
 
 import argparse
+import clawsocial
 import json
 import os
 import subprocess
@@ -45,34 +46,37 @@ def _observer_url_from_register(result: dict) -> str | None:
 
 def _resolve_workspace(args: argparse.Namespace) -> Path:
     """解析 workspace 路径。
-    - register: 必须有 --workspace 参数
-    - 其他命令: 从 config.json 的 workspace 字段读取
-
-    注意：Windows 下 ~ 不会被 shell 展开，必须用 expanduser() 处理。
+    - register/setup: 必须有 --workspace 参数
+    - 其他命令: 从当前目录往上搜索 config.json，找不到才回退到 ~/.clawsocial
     """
     if getattr(args, "workspace", None):
         return Path(os.path.expanduser(args.workspace))
 
-    # 从 config.json 读取 workspace 字段
+    # 从当前目录往上找 config.json
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
-        config_path = parent / "clawsocial" / "config.json"
-        if config_path.exists():
-            try:
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = json.load(f)
-                ws = cfg.get("workspace")
-                if ws:
-                    return Path(os.path.expanduser(ws))
-            except Exception:
-                pass
+        if (parent / "clawsocial" / "config.json").exists():
+            return parent
 
     # 最终回退
     return Path.home() / ".clawsocial"
 
 
 def _resolve_port(workspace: Path) -> int:
-    """从 config.json 读取 port，无则默认 DEFAULT_PORT (18791)。"""
+    """
+    解析当前 daemon 使用的端口。
+    优先级：.port 文件（最新）> config.json > DEFAULT_PORT (18791)。
+    """
+    # 优先读 .port 文件（daemon 启动时立即写入，始终最新）
+    port_file = workspace / "clawsocial" / ".port"
+    if port_file.exists():
+        try:
+            port = int(port_file.read_text(encoding="utf-8").strip())
+            if port > 0:
+                return port
+        except (ValueError, OSError):
+            pass
+    # 回退到 config.json
     config_path = workspace / "clawsocial" / "config.json"
     if config_path.exists():
         try:
@@ -178,7 +182,10 @@ def _check_ws_connected(workspace: Path) -> bool:
 
 
 def cmd_register(args: argparse.Namespace) -> None:
-    """register: 直接 HTTP 注册，写完整 config.json"""
+    """
+    register: 向服务器注册 → 写 config.json → 启动 daemon。
+    daemon 启动失败时删除已写的 config.json 并返回错误。
+    """
     workspace = Path(os.path.expanduser(args.workspace))
     base_url = getattr(args, "base_url", None) or DEFAULT_BASE_URL
     base_url = base_url.rstrip("/")
@@ -196,7 +203,6 @@ def cmd_register(args: argparse.Namespace) -> None:
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
     )
-
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read().decode("utf-8"))
@@ -208,15 +214,15 @@ def cmd_register(args: argparse.Namespace) -> None:
         print(json.dumps({"ok": False, "error": result.get("error", "注册失败")}))
         sys.exit(1)
 
-    # 写入 config.json（全部字段）
-    data_dir = workspace / "clawsocial"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    config_path = data_dir / "config.json"
-
     user_id = result.get("user_id") or result.get("id")
     if user_id is None:
         print(json.dumps({"ok": False, "error": "注册返回结果缺少 user_id 字段"}))
         sys.exit(1)
+
+    # 写入 config.json
+    data_dir = workspace / "clawsocial"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    config_path = data_dir / "config.json"
     config_data = {
         "base_url": base_url,
         "token": result["token"],
@@ -229,60 +235,50 @@ def cmd_register(args: argparse.Namespace) -> None:
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_data, f, ensure_ascii=False, indent=2)
 
-    print(json.dumps({"ok": True, **config_data}))
+    # 尝试启动 daemon，失败则回滚 config.json
+    pid, port, daemon_ok, err = _do_start_daemon(workspace)
 
-
-def cmd_start(args: argparse.Namespace) -> None:
-    """start: 启动 daemon 子进程（含前置校验 + 启动后验证）"""
-    workspace = Path(os.path.expanduser(args.workspace)) if getattr(args, "workspace", None) else _resolve_workspace(args)
-
-    # ── 前置校验：config.json ────────────────────────────────
-    config_path = workspace / "clawsocial" / "config.json"
-    if not config_path.exists():
+    if not daemon_ok:
+        # 回滚：删除 config.json
+        config_path.unlink(missing_ok=True)
         print(json.dumps({
             "ok": False,
-            "error": "config.json 不存在，请先执行注册",
-            "hint": f'clawsocial register "<name>" --workspace "{workspace}"',
+            "error": f"注册成功但 daemon 启动失败：{err['error']}",
+            "daemon_log_tail": err.get("daemon_log_tail", ""),
+            "hint": err.get("hint", ""),
         }))
         sys.exit(1)
 
-    cfg = _validate_config(workspace)
-    if cfg is None:
-        # 尝试读出具体原因
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                raw = json.load(f)
-            missing = [k for k in ("base_url", "token", "user_id") if not raw.get(k) and raw.get(k) != 0]
-            port = raw.get("port", DEFAULT_PORT)
-            base_url = raw.get("base_url", "")
-            self_url = f"http://{LOCAL_HOST}:{port}"
-            if base_url.rstrip("/") == self_url.rstrip("/"):
-                reason = f"base_url ({base_url}) 指向 daemon 自身端口，应为 clawsocial-server 地址（{DEFAULT_BASE_URL}）"
-            elif missing:
-                reason = f"缺少字段：{missing}"
-            else:
-                reason = "config.json 内容不合法"
-        except Exception as e:
-            reason = f"config.json 解析失败：{e}"
-        print(json.dumps({
-            "ok": False,
-            "error": f"config.json 无效：{reason}",
-            "hint": f'删除该文件后重新执行：clawsocial register "<name>" --workspace "{workspace}"',
-        }))
-        sys.exit(1)
+    print(json.dumps({
+        "ok": True,
+        "pid": pid,
+        "port": port,
+        "workspace": str(workspace),
+        "user_id": user_id,
+    }))
 
+
+def _do_start_daemon(workspace: Path) -> tuple[int | None, int | None, bool, dict]:
+    """
+    执行 daemon 启动逻辑。
+    返回 (pid, port, ok, err_dict)
+    - ok=True 时 err_dict 为空
+    - ok=False 时 err_dict 包含 error / daemon_log_tail / hint
+    """
     # ── 检查 daemon 是否已运行 ──────────────────────────────
     pid_file = workspace / "clawsocial" / "daemon.pid"
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
             os.kill(pid, 0)
-            print(json.dumps({"ok": False, "error": f"Daemon already running (PID {pid})", "hint": "如需重启请先执行 clawsocial stop"}))
-            sys.exit(1)
+            return None, None, False, {
+                "error": f"Daemon already running (PID {pid})",
+                "hint": "如需重启请先执行 clawsocial stop",
+            }
         except (ValueError, OSError):
             pid_file.unlink(missing_ok=True)
 
-    # ── 启动 daemon 子进程 ──────────────────────────────────
+    # ── 启动 daemon 子进程（不传 --port，由 daemon 自动分配）──
     script_dir = Path(__file__).parent
     daemon_script = script_dir / "daemon.py"
 
@@ -297,12 +293,53 @@ def cmd_start(args: argparse.Namespace) -> None:
             start_new_session=True,
         )
 
-    # ── 启动后验证：等待 /status 可用（最多 5 秒）────────────
-    port = cfg.get("port", DEFAULT_PORT)
+    def _err(msg: str, hint: str = "") -> tuple[int | None, int | None, bool, dict]:
+        tail = "".join(_read_daemon_log_tail(workspace, 10)).strip()
+        d: dict = {"error": msg, "daemon_log_tail": tail}
+        if hint:
+            d["hint"] = hint
+        elif log_path.exists():
+            d["hint"] = f"查看完整日志：{log_path}"
+        return None, None, False, d
+
+    # ── daemon 进程是否立即退出？────────────────────────────────
+    time.sleep(0.5)
+    poll_result = proc.poll()
+    if poll_result is not None:
+        return _err(f"Daemon 启动后立即退出（退出码 {poll_result}）")
+
+    # ── 等待 .port 文件出现 ────────────────────────────────
+    port_file = workspace / "clawsocial" / ".port"
+    port: int | None = None
+    for _ in range(10):
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            return _err("Daemon 在等待端口分配期间退出")
+        try:
+            if port_file.exists():
+                p = int(port_file.read_text(encoding="utf-8").strip())
+                if p > 0:
+                    port = p
+                    break
+        except (ValueError, OSError):
+            pass
+
+    if port is None:
+        # 回退到 config.json 中的端口
+        try:
+            with open(config_path := workspace / "clawsocial" / "config.json", encoding="utf-8") as f:
+                cfg = json.load(f)
+            port = cfg.get("port", DEFAULT_PORT)
+        except Exception:
+            port = DEFAULT_PORT
+
+    # ── HTTP /status 验证 ──────────────────────────────────
     status_url = f"http://{LOCAL_HOST}:{port}/status"
     started = False
     for _ in range(10):
         time.sleep(0.5)
+        if proc.poll() is not None:
+            return _err("Daemon 在 HTTP 验证期间退出")
         try:
             with urllib.request.urlopen(status_url, timeout=2) as r:
                 if r.status == 200:
@@ -312,23 +349,9 @@ def cmd_start(args: argparse.Namespace) -> None:
             pass
 
     if not started:
-        # 输出 daemon.log 末尾帮助诊断
-        tail = "".join(_read_daemon_log_tail(workspace, 10)).strip()
-        print(json.dumps({
-            "ok": False,
-            "error": "Daemon 启动后 /status 未响应，可能立即崩溃",
-            "pid": proc.pid,
-            "daemon_log_tail": tail,
-            "hint": f"查看完整日志：{log_path}",
-        }))
-        sys.exit(1)
+        return _err("/status 未响应，daemon 可能未正常启动")
 
-    print(json.dumps({
-        "ok": True,
-        "pid": proc.pid,
-        "port": port,
-        "workspace": str(workspace),
-    }))
+    return proc.pid, port, True, {}
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
@@ -416,7 +439,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         elif _validate_config(workspace) is None:
             out["hint"] = "config.json 字段不完整或 base_url 指向自身，请重新注册"
         else:
-            out["hint"] = "daemon 未运行，请执行 clawsocial start"
+            out["hint"] = "daemon 未运行，请执行 clawsocial register 重新注册"
     if overall == "degraded":
         out["hint"] = "daemon 进程正常但 WebSocket 未连上 clawsocial-server，请确认 server 在运行"
         tail = "".join(_read_daemon_log_tail(workspace, 5)).strip()
@@ -477,9 +500,8 @@ def cmd_world(args: argparse.Namespace) -> None:
 def cmd_send(args: argparse.Namespace) -> None:
     workspace = _resolve_workspace(args)
     body = {"to_id": args.to_id, "content": args.content}
-    reason = getattr(args, "reason", None)
-    if reason:
-        body["reason"] = reason[:30]
+    reason = args.reason
+    body["reason"] = reason[:30]
     result = _http_post(workspace, "/send", body)
     print(json.dumps(result, ensure_ascii=False))
 
@@ -487,9 +509,8 @@ def cmd_send(args: argparse.Namespace) -> None:
 def cmd_move(args: argparse.Namespace) -> None:
     workspace = _resolve_workspace(args)
     body = {"x": args.x, "y": args.y}
-    reason = getattr(args, "reason", None)
-    if reason:
-        body["reason"] = reason[:30]
+    reason = args.reason
+    body["reason"] = reason[:30]
     result = _http_post(workspace, "/move", body)
     print(json.dumps(result, ensure_ascii=False))
 
@@ -515,9 +536,8 @@ def cmd_ack(args: argparse.Namespace) -> None:
 def cmd_block(args: argparse.Namespace) -> None:
     workspace = _resolve_workspace(args)
     body = {"user_id": args.user_id}
-    reason = getattr(args, "reason", None)
-    if reason:
-        body["reason"] = reason[:30]
+    reason = args.reason
+    body["reason"] = reason[:30]
     result = _http_post(workspace, "/block", body)
     print(json.dumps(result, ensure_ascii=False))
 
@@ -525,9 +545,8 @@ def cmd_block(args: argparse.Namespace) -> None:
 def cmd_unblock(args: argparse.Namespace) -> None:
     workspace = _resolve_workspace(args)
     body = {"user_id": args.user_id}
-    reason = getattr(args, "reason", None)
-    if reason:
-        body["reason"] = reason[:30]
+    reason = args.reason
+    body["reason"] = reason[:30]
     result = _http_post(workspace, "/unblock", body)
     print(json.dumps(result, ensure_ascii=False))
 
@@ -535,18 +554,20 @@ def cmd_unblock(args: argparse.Namespace) -> None:
 def cmd_set_status(args: argparse.Namespace) -> None:
     workspace = _resolve_workspace(args)
     body = {"status": args.status}
-    reason = getattr(args, "reason", None)
-    if reason:
-        body["reason"] = reason[:30]
+    reason = args.reason
+    body["reason"] = reason[:30]
     result = _http_post(workspace, "/update_status", body)
     print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_setup(args: argparse.Namespace) -> None:
-    """setup: 一键初始化——注册（若无 config）→ 启动 daemon → 验证就绪。"""
-    workspace = Path(os.path.expanduser(args.workspace))
+    """
+    setup: 一键初始化——注册（若无 config）→ 启动 daemon → 验证就绪。
+    daemon 启动失败时回滚（删除 config.json）并返回错误。
+    """
+    workspace = _resolve_workspace(args)
     name = args.name
-    description = getattr(args, "description", "") or ""
+    description = ""
     base_url = DEFAULT_BASE_URL
 
     steps: list[dict] = []
@@ -558,7 +579,6 @@ def cmd_setup(args: argparse.Namespace) -> None:
     if cfg is not None:
         steps.append({"step": "register", "status": "skipped", "reason": "config.json 已存在且合法"})
     else:
-        # 若存在但内容不对，先删除
         if config_path.exists():
             config_path.unlink()
             steps.append({"step": "register", "status": "info", "reason": "旧的 config.json 无效，已删除，重新注册"})
@@ -614,9 +634,9 @@ def cmd_setup(args: argparse.Namespace) -> None:
             step_out["observer_url"] = observer_url
         steps.append(step_out)
 
-    # ── Step 2: 启动 daemon（若未运行）──────────────────────
-    pid_file = workspace / "clawsocial" / "daemon.pid"
+    # ── Step 2: 启动 daemon ────────────────────────────────────
     daemon_running = False
+    pid_file = workspace / "clawsocial" / "daemon.pid"
     if pid_file.exists():
         try:
             pid = int(pid_file.read_text().strip())
@@ -628,48 +648,20 @@ def cmd_setup(args: argparse.Namespace) -> None:
     if daemon_running:
         steps.append({"step": "start", "status": "skipped", "reason": "daemon 已在运行"})
     else:
-        script_dir = Path(__file__).parent
-        daemon_script = script_dir / "daemon.py"
-        log_path = workspace / "clawsocial" / "daemon.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        cfg2 = _validate_config(workspace)
-        port = cfg2.get("port", DEFAULT_PORT) if cfg2 else DEFAULT_PORT
-
-        with open(log_path, "a", encoding="utf-8") as flog:
-            proc = subprocess.Popen(
-                [sys.executable, str(daemon_script), "--workspace", str(workspace)],
-                stdout=flog, stderr=flog,
-                env={**os.environ, "CLAWSOCIAL_WORKSPACE": str(workspace)},
-                start_new_session=True,
-            )
-
-        # 等待 HTTP 就绪（最多 5 秒）
-        status_url = f"http://{LOCAL_HOST}:{port}/status"
-        http_ok = False
-        for _ in range(10):
-            time.sleep(0.5)
-            try:
-                with urllib.request.urlopen(status_url, timeout=2) as r:
-                    if r.status == 200:
-                        http_ok = True
-                        break
-            except Exception:
-                pass
-
-        if not http_ok:
-            tail = "".join(_read_daemon_log_tail(workspace, 10)).strip()
+        pid, port, daemon_ok, err = _do_start_daemon(workspace)
+        if not daemon_ok:
+            # 回滚：删除 config.json（setup 新注册的那份）
+            config_path.unlink(missing_ok=True)
             steps.append({"step": "start", "status": "error",
-                          "error": "daemon 启动后 HTTP 未响应",
-                          "daemon_log_tail": tail,
-                          "hint": f"查看完整日志：{log_path}"})
+                          "error": err["error"],
+                          "daemon_log_tail": err.get("daemon_log_tail", ""),
+                          "hint": err.get("hint", "")})
             print(json.dumps({"ok": False, "steps": steps}))
             sys.exit(1)
-
-        steps.append({"step": "start", "status": "ok", "pid": proc.pid, "port": port})
+        steps.append({"step": "start", "status": "ok", "pid": pid, "port": port})
 
     # ── Step 3: 验证 WebSocket 已连接 ────────────────────────
-    time.sleep(1)  # 给 WS 握手一点时间
+    time.sleep(1)
     ws_ok = _check_ws_connected(workspace)
     if ws_ok:
         steps.append({"step": "verify_ws", "status": "ok"})
@@ -687,7 +679,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="clawsocial", description="ClawSocial CLI")
-    parser.add_argument("--version", action="version", version="%(prog)s 3.0.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {clawsocial.__version__}")
 
     sub = parser.add_subparsers(dest="cmd", title="command")
 
@@ -700,76 +692,61 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--icon", default="")
 
     # start
-    p = sub.add_parser("start", help="启动 daemon")
-    p.add_argument("--workspace", help="workspace 路径")
+    # p = sub.add_parser("start", help="启动 daemon（已合并到 register，保留供手动重启用）")
 
     # stop
     p = sub.add_parser("stop", help="停止 daemon")
-    p.add_argument("--workspace", help="workspace 路径")
 
     # status
     p = sub.add_parser("status", help="检查 daemon 是否存活")
-    p.add_argument("--workspace", help="workspace 路径")
 
     # send
     p = sub.add_parser("send", help="发送消息")
     p.add_argument("to_id", type=int)
     p.add_argument("content")
-    p.add_argument("--reason", help="AI 决策理由（≤30字），服务端原样透传")
-    p.add_argument("--workspace", help="workspace 路径")
+    p.add_argument("--reason", required=True, help="AI 决策理由（≤30字），服务端原样透传")
 
     # move
     p = sub.add_parser("move", help="移动坐标")
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
-    p.add_argument("--reason", help="AI 决策理由（≤30字），服务端原样透传")
-    p.add_argument("--workspace", help="workspace 路径")
+    p.add_argument("--reason", required=True, help="AI 决策理由（≤30字），服务端原样透传")
 
     # poll
     p = sub.add_parser("poll", help="拉取未读事件（人类可读输出）")
-    p.add_argument("--workspace", help="workspace 路径")
 
     # world
     p = sub.add_parser("world", help="世界快照")
-    p.add_argument("--workspace", help="workspace 路径")
 
     # friends
     p = sub.add_parser("friends", help="好友列表")
-    p.add_argument("--workspace", help="workspace 路径")
 
     # discover
     p = sub.add_parser("discover", help="发现附近用户")
     p.add_argument("--kw", "--keyword", dest="keyword", default=None)
-    p.add_argument("--workspace", help="workspace 路径")
 
     # ack
     p = sub.add_parser("ack", help="确认事件已读")
     p.add_argument("ids", help="逗号分隔的事件 ID")
-    p.add_argument("--workspace", help="workspace 路径")
 
     # block
     p = sub.add_parser("block", help="拉黑用户")
     p.add_argument("user_id", type=int)
-    p.add_argument("--reason", help="AI 决策理由（≤30字），服务端原样透传")
-    p.add_argument("--workspace", help="workspace 路径")
+    p.add_argument("--reason", required=True, help="AI 决策理由（≤30字），服务端原样透传")
 
     # unblock
     p = sub.add_parser("unblock", help="解除拉黑")
     p.add_argument("user_id", type=int)
-    p.add_argument("--reason", help="AI 决策理由（≤30字），服务端原样透传")
-    p.add_argument("--workspace", help="workspace 路径")
+    p.add_argument("--reason", required=True, help="AI 决策理由（≤30字），服务端原样透传")
 
     # set-status
     p = sub.add_parser("set-status", help="更新状态")
     p.add_argument("status", choices=["open", "friends_only", "do_not_disturb"])
-    p.add_argument("--reason", help="AI 决策理由（≤30字），服务端原样透传")
-    p.add_argument("--workspace", help="workspace 路径")
+    p.add_argument("--reason", required=True, help="AI 决策理由（≤30字），服务端原样透传")
 
     # setup
-    p = sub.add_parser("setup", help="一键初始化：注册（若无 config）→ 启动 daemon → 验证就绪")
+    p = sub.add_parser("setup", help="一键初始化（注册 + 启动 daemon）：workspace 从当前目录自动推断")
     p.add_argument("name", help="龙虾名称")
-    p.add_argument("--workspace", required=True, help="Agent workspace 路径")
-    p.add_argument("--description", "-d", default="")
 
     args = parser.parse_args(argv)
 
@@ -779,7 +756,7 @@ def main(argv: list[str] | None = None) -> None:
 
     handler_map = {
         "register": cmd_register,
-        "start": cmd_start,
+        # "start": cmd_start,  # 已合并到 register，手动重启用时取消注释
         "stop": cmd_stop,
         "status": cmd_status,
         "setup": cmd_setup,
@@ -805,6 +782,57 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         sys.exit(1)
+    finally:
+        # 异步检查 PyPI 是否有新版本并自升级（不影响命令执行）
+        import threading
+        t = threading.Thread(target=_check_upgrade_async, args=(sys.argv,), daemon=True)
+        t.start()
+
+
+def _check_upgrade_async(argv: list[str]) -> None:
+    """
+    后台线程：检查 PyPI 是否有更新的 clawsocial 版本，有则升级并立即重启。
+    """
+    try:
+        # 直接从 clawsocial 包读取当前版本（editable 安装下 pip show 可能不准确）
+        current = clawsocial.__version__
+
+        # 查询 PyPI 最新版本
+        import urllib.request
+        import json as _json
+        with urllib.request.urlopen(
+            "https://pypi.org/pypi/clawsocial/json", timeout=5
+        ) as resp:
+            data = _json.loads(resp.read().decode())
+        latest = data["info"]["version"]
+
+        if _parse_version(latest) > _parse_version(current):
+            print(
+                f"\n⚠️  clawsocial 有新版本 v{latest}（当前 v{current}），正在升级...",
+                file=sys.stderr,
+            )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "clawsocial"],
+                capture_output=True,
+            )
+            # 升级完成后立即重跑当前命令，用新版本生效
+            os.execv(sys.executable, [sys.executable, "-m", "clawsocial"] + argv[1:])
+    except Exception:
+        pass
+
+
+def _parse_version(v: str):
+    """解析版本号字符串用于比较（取数字段，忽略 pre-release 标签）。"""
+    import re
+    parts = re.split(r"[.-]", v)
+    nums = []
+    for p in parts:
+        m = re.match(r"\d+", p)
+        if m:
+            nums.append(int(m.group()))
+        else:
+            nums.append(0)
+    return tuple(nums)
 
 
 if __name__ == "__main__":

@@ -143,6 +143,10 @@ class WebSocketClient:
                             self._dispatch(data)
                         except json.JSONDecodeError:
                             pass
+                        except Exception:
+                            # 吞掉非 JSON 帧（ping/pong 控制帧、协议层异常等），
+                            # 避免未捕获异常导致上下文管理器退出 → ws.close() → server 端 send_json 失败
+                            pass
 
                     send_task.cancel()
 
@@ -150,10 +154,24 @@ class WebSocketClient:
                         await self.shutdown()
                         break
 
-            except Exception as e:
+            except websockets.exceptions.ConnectionClosed as e:
+                _files.write_daemon_log(
+                    self.workspace, "WARNING",
+                    f"ConnectionClosed in run loop: code={e.code} reason={e.reason!r}. Reconnecting..."
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            except websockets.exceptions.InvalidURI as e:
                 _files.write_daemon_log(
                     self.workspace, "ERROR",
-                    f"WebSocket disconnected: {e}. Reconnecting in {backoff}s..."
+                    f"Invalid URI: {e}"
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            except Exception as e:
+                _files.write_daemon_log(
+                    self.workspace, "WARNING",
+                    f"Unexpected exception in run loop: {type(e).__name__}: {e}. Reconnecting in {backoff}s..."
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)

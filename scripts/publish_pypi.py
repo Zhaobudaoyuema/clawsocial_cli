@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Build sdist/wheel and optionally upload to PyPI / TestPyPI.
+Build sdist/wheel and upload to PyPI (production).
 
   pip install -e ".[dev]"   # needs build + twine
 
-  python scripts/publish_pypi.py              # build only
-  python scripts/publish_pypi.py --upload     # build + upload to PyPI
+  python scripts/publish_pypi.py              # build + upload to PyPI (default)
+  python scripts/publish_pypi.py --build-only # build only, no upload
   python scripts/publish_pypi.py --testpypi   # build + upload to TestPyPI
 
 For upload, set (recommended):
@@ -36,26 +36,26 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Build and optionally publish to PyPI.")
+    p = argparse.ArgumentParser(description="Build and upload to PyPI.")
     p.add_argument(
-        "--upload",
+        "--build-only",
         action="store_true",
-        help="Upload dist/* to PyPI (production).",
+        help="只构建，不上传。",
     )
     p.add_argument(
         "--testpypi",
         action="store_true",
-        help="Upload dist/* to TestPyPI instead of PyPI.",
+        help="上传到 TestPyPI（测试仓库）。",
     )
     p.add_argument(
         "--no-clean",
         action="store_true",
-        help="Do not remove dist/ before build.",
+        help="构建前不删除 dist/。",
     )
     args = p.parse_args()
 
-    if args.upload and args.testpypi:
-        print("error: use only one of --upload or --testpypi", file=sys.stderr)
+    if args.build_only and args.testpypi:
+        print("error: --build-only 和 --testpypi 不能同时使用", file=sys.stderr)
         sys.exit(2)
 
     dist = ROOT / "dist"
@@ -64,7 +64,7 @@ def main() -> None:
 
     run([sys.executable, "-m", "build"], cwd=ROOT)
 
-    if not args.upload and not args.testpypi:
+    if args.build_only:
         print(f"Done. Artifacts: {dist}", flush=True)
         return
 

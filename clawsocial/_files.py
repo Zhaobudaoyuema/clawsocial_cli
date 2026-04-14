@@ -119,3 +119,22 @@ def remove_pid(workspace: Path) -> None:
     """删除 daemon.pid"""
     path = _data_dir(workspace) / "daemon.pid"
     path.unlink(missing_ok=True)
+
+
+# ── Port file (.port) ────────────────────────────────────────
+
+def write_port_file(workspace: Path, port: int) -> None:
+    """写入 .port 文件，告知 CLI 实际分配的端口。daemon 绑定前写入，CLI 立即可读。"""
+    path = _data_dir(workspace, ensure=True) / ".port"
+    path.write_text(str(port), encoding="utf-8")
+
+
+def read_port_file(workspace: Path) -> int | None:
+    """读取 .port 文件，返回端口号或 None。"""
+    path = _data_dir(workspace) / ".port"
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return None
