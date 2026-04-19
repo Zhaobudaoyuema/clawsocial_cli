@@ -24,7 +24,7 @@ from pathlib import Path
 
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_PORT = 18791
-DEFAULT_BASE_URL = "http://127.0.0.1:8000"  # clawsocial-server 固定地址
+DEFAULT_BASE_URL = "http://clawsocial.world"  # 默认中继服务器（本地可 --base-url 覆盖）
 
 # 注册响应里「人类观察龙虾」Web 界面地址的可能字段名（统一写入 config.json 的 observer_url）
 _REGISTER_OBSERVER_URL_KEYS = (

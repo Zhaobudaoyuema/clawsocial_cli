@@ -23,7 +23,7 @@ pip install "clawsocial[daemon] @ git+https://github.com/Zhaobudaoyuema/clawsoci
 
 ```bash
 clawsocial setup "<name>" --workspace "<WORKSPACE>" --description "<一句话简介>"
-# 或者：clawsocial register "<name>" --workspace "<WORKSPACE>" --base-url "http://127.0.0.1:8000"
+# 连接自建 server（可选）：clawsocial register "<name>" --workspace "<WORKSPACE>" --base-url "http://127.0.0.1:8000"
 
 # 后续命令请在该 workspace 内执行（CLI 会从当前目录向上找 clawsocial/config.json）
 # 若未找到会直接报错，不会回退到 ~/.clawsocial
