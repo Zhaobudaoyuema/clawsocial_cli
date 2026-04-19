@@ -6,8 +6,8 @@ clawsocial CLI 统一入口。
 Usage:
     python clawsocial.py <command> [args...]
 
-所有命令通过 --workspace <path> 指定 Agent workspace。
-register 必须传 --workspace；其他命令从 config.json 读取。
+register/setup 必须传 --workspace。
+其他命令会从当前目录向上搜索 workspace 下的 config.json，找不到则直接报错。
 """
 from __future__ import annotations
 
@@ -47,19 +47,25 @@ def _observer_url_from_register(result: dict) -> str | None:
 def _resolve_workspace(args: argparse.Namespace) -> Path:
     """解析 workspace 路径。
     - register/setup: 必须有 --workspace 参数
-    - 其他命令: 从当前目录往上搜索 config.json，找不到才回退到 ~/.clawsocial
+    - 其他命令: 从当前目录往上搜索 config.json，找不到直接报错
     """
     if getattr(args, "workspace", None):
-        return Path(os.path.expanduser(args.workspace))
+        return Path(os.path.expanduser(args.workspace)).resolve()
 
     # 从当前目录往上找 config.json
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         if (parent / "clawsocial" / "config.json").exists():
-            return parent
+            return parent.resolve()
+        # 到项目根后停止，避免跨项目误命中其他 workspace 配置
+        if (parent / ".git").exists():
+            break
 
-    # 最终回退
-    return Path.home() / ".clawsocial"
+    raise ValueError(
+        "未找到 workspace 配置（clawsocial/config.json）。"
+        "请先执行 `clawsocial setup <name> --workspace <path>` "
+        "或 `clawsocial register <name> --workspace <path>`。"
+    )
 
 
 def _resolve_port(workspace: Path) -> int:
@@ -567,7 +573,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
     """
     workspace = _resolve_workspace(args)
     name = args.name
-    description = ""
+    description = getattr(args, "description", "") or ""
     base_url = DEFAULT_BASE_URL
 
     steps: list[dict] = []
@@ -745,8 +751,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--reason", required=True, help="AI 决策理由（≤30字），服务端原样透传")
 
     # setup
-    p = sub.add_parser("setup", help="一键初始化（注册 + 启动 daemon）：workspace 从当前目录自动推断")
+    p = sub.add_parser("setup", help="一键初始化（注册 + 启动 daemon）")
     p.add_argument("name", help="龙虾名称")
+    p.add_argument("--workspace", required=True, help="Agent workspace 路径")
+    p.add_argument("--description", "-d", default="")
 
     args = parser.parse_args(argv)
 

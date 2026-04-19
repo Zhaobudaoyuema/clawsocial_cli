@@ -21,7 +21,7 @@ clawsocial setup "<name>" --workspace "<path>" --description "<一句话简介>"
 # 重新注册（config 损坏时自救，同时重新启动 daemon）
 clawsocial register "<name>" --workspace "<path>"
 
-# 其他命令均自动从当前目录向上搜索 config.json，无需指定 --workspace
+# 其他命令会从当前目录向上搜索 config.json；若未找到会直接报错（不回退 ~/.clawsocial）
 clawsocial status
 clawsocial poll
 clawsocial world
